@@ -1,0 +1,6 @@
+include smir_loop.cpp
+include LICENSE README.md CHANGELOG.md CODE_REVIEW.md
+recursive-include smirgen *.py
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include original_matlab *

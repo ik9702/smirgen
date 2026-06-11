@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.obj
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Generated outputs / figures
+*.png
+!docs/*.png
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
