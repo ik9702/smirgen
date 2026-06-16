@@ -65,6 +65,32 @@ def order_per_freq(freq, c, sph_radius, factor=1.0, margin=0, n_min=0,
     return n
 
 
+_MODE_STRENGTH_CACHE = {}
+_HP_FILTER_CACHE = {}
+
+
+def _mode_strength_cached(sph_type, sph_radius, k, n_harm):
+    """Memoized wrapper around :func:`_mode_strength`.
+
+    In dataset generation the mode strength is identical across every call that
+    shares ``(sphType, sphRadius, k-grid, N_harm)`` (i.e. fixed array, sampling
+    rate, nsample and order rule) yet the scipy spherical-Bessel evaluation
+    dominates the runtime. Cache it on the byte content of the wavenumber grid
+    so repeated calls reuse the result. Returns copies so callers may mutate the
+    arrays freely. The cache is capped to avoid unbounded growth.
+    """
+    key = (sph_type, float(sph_radius), int(n_harm), k.shape, k.tobytes())
+    hit = _MODE_STRENGTH_CACHE.get(key)
+    if hit is None:
+        ms, n_eff = _mode_strength(sph_type, sph_radius, k, n_harm)
+        if len(_MODE_STRENGTH_CACHE) > 32:
+            _MODE_STRENGTH_CACHE.clear()
+        _MODE_STRENGTH_CACHE[key] = (ms, n_eff)
+        hit = (ms, n_eff)
+    ms, n_eff = hit
+    return ms.copy(), n_eff
+
+
 def _mode_strength(sph_type, sph_radius, k, n_harm):
     """Far-field mode strength b_n(k r), shape (k_total, n_harm+1).
 
@@ -325,7 +351,7 @@ def smir_generator(c, procFs, sphLocation, s, L, beta, sphType, sphRadius, mic,
         # Single microphone: mode strength is unused by the native loop.
         ms = np.zeros((k_total, N_max + 1), dtype=complex)
     else:
-        ms, N_max = _mode_strength(sphType, sphRadius, k, N_max)
+        ms, N_max = _mode_strength_cached(sphType, sphRadius, k, N_max)
 
     # The overflow guard may have lowered N_max; clip the per-bin orders to it.
     if n_per is not None:
@@ -366,7 +392,11 @@ def smir_generator(c, procFs, sphLocation, s, L, beta, sphType, sphRadius, mic,
     h = h[:, :nsample]
 
     if HP == 1:
-        b, a = butter(4, 50 / (procFs / 2), btype="high")
+        ba = _HP_FILTER_CACHE.get(procFs)
+        if ba is None:
+            ba = butter(4, 50 / (procFs / 2), btype="high")
+            _HP_FILTER_CACHE[procFs] = ba
+        b, a = ba
         h = lfilter(b, a, h, axis=1)
 
     return h, H, beta_hat

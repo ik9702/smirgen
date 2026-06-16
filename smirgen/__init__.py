@@ -22,4 +22,4 @@ from .analysis import relative_db, direct_reference
 
 __all__ = ["smir_generator", "order_per_freq", "sph2cart", "cart2sph",
            "plot_geometry", "relative_db", "direct_reference"]
-__version__ = "2.5.0"
+__version__ = "2.5.1"

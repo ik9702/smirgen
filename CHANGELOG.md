@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.5.1
+- **Performance (dataset generation)**: cache the spherical mode strength and
+  the high-pass filter coefficients across calls. In a generation loop with a
+  fixed array, sampling rate, `nsample` and `N_harm` rule these are identical
+  every call, yet the scipy spherical-Bessel evaluation dominated the runtime
+  (~77% of a call). Repeated calls that only vary the source/room geometry now
+  reuse the cached result. Output unchanged to machine precision; ~10x faster
+  per call in typical dataset loops.
+
 ## 2.5.0
 - **Frequency-dependent `N_harm`**: `smir_generator` now accepts a scalar, a
   per-frequency-bin array, or a callable `freq -> order`. The native loop sums
