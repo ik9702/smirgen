@@ -24,4 +24,4 @@ from .torch_gen import SmirArray            # GPU backend (torch imported lazily
 __all__ = ["smir_generator", "smir_generator_batch", "order_per_freq",
            "sph2cart", "cart2sph", "plot_geometry", "relative_db",
            "direct_reference", "SmirArray"]
-__version__ = "2.7.1"
+__version__ = "2.8.0"

@@ -172,25 +172,33 @@ class SmirArray:
         mic_pos = np.column_stack([mx_, my_, mz_]).astype(float)
         self.M = mic_pos.shape[0]
 
+        # ---- frequency ordering by required spherical-harmonic order --------
+        # At frequency k only orders l <= n_per[k] contribute. Sorting the bins
+        # by n_per (descending) makes "orders >= l are active" a contiguous top
+        # slice whose length ``counts[l]`` shrinks as l grows, so the per-order
+        # Hankel recurrence and contraction touch only the still-active bins
+        # (low frequencies drop out early). This both avoids the wasted work on
+        # masked entries and removes the need for an inf*0->NaN guard.
+        n_per = np.clip(n_per, 0, self.N_max).astype(int)
+        perm = np.argsort(-n_per, kind="stable")          # descending by order
+        n_per_sorted = n_per[perm]
+        counts = [int((n_per_sorted >= l).sum()) for l in range(self.N_max + 1)]
+        self.counts = counts
+        shd_k_l = shd_k_l[perm]                            # rows -> sorted order
+        waveNr = waveNr[perm]
+        self._perm = perm
+
         # ---- move constants to the device ----------------------------------
         t = torch
         self.shd_k_l = t.as_tensor(shd_k_l, dtype=cdt, device=self.device)      # (K, L+1)
-        self.waveNr = t.as_tensor(waveNr, dtype=rdt, device=self.device)        # (K,)
+        self.waveNr = t.as_tensor(waveNr, dtype=rdt, device=self.device)        # (K,) sorted
+        self.perm = t.as_tensor(perm, dtype=t.long, device=self.device)         # (K,)
         self.mic_pos = t.as_tensor(mic_pos, dtype=rdt, device=self.device)      # (M, 3)
         self.sign = t.as_tensor(self._sign, dtype=rdt, device=self.device)      # (P, 3)
         self.const = t.as_tensor(self._const, dtype=rdt, device=self.device)    # (P, 3)
         self.reflbeta = t.as_tensor(self._reflbeta, dtype=rdt, device=self.device)  # (P,)
         self.l_factor = t.as_tensor(2 * np.arange(self.N_max + 1) + 1.0,
                                     dtype=rdt, device=self.device)              # (L+1,)
-        # Per-(freq, order) activity mask: at frequency k only orders
-        # l <= n_per[k] contribute. The Hankel recurrence overflows for
-        # masked (low-freq, high-l) entries; masking the Hankel before the
-        # contraction stops inf*0 -> NaN from polluting H (essential in
-        # float32; harmless in float64).
-        order_active = (np.arange(self.N_max + 1)[None, :] <=
-                        np.clip(n_per, 0, self.N_max)[:, None])
-        self.order_active = t.as_tensor(order_active, dtype=t.bool,
-                                        device=self.device)                    # (K, L+1)
         self.k_total = k_total
         self.P = self.sign.shape[0]
 
@@ -262,7 +270,14 @@ class SmirArray:
 
     # -----------------------------------------------------------------------
     def _accumulate(self, sb, S, sph_samp, image_tile):
-        """H[S, M, K] = sum over image sources of the harmonic expansion."""
+        """H[S, M, K] = sum over image sources of the harmonic expansion.
+
+        Frequencies are held in descending-order-of-``n_per`` (sorted at
+        construction). At harmonic order ``l`` only the first ``counts[l]``
+        sorted bins are still active, so the recurrence and contraction operate
+        on a shrinking prefix. H is un-sorted back to the natural bin order
+        before returning.
+        """
         t = self.torch
         # image positions (sample units): hu[S,P,3] = sign[P,3]*s[S,3] + const[P,3]
         hu = self.sign[None] * sb[:, None, :] + self.const[None]       # (S, P, 3)
@@ -270,28 +285,27 @@ class SmirArray:
         valid = (t.floor(dist + sph_samp) < self.nsample) & (dist > 1e-9)
         u = hu / dist.clamp_min(1e-30)[..., None]                      # (S, P, 3)
         R_norm = dist * self.cTs                                       # (S, P) physical
-        # cos(theta) between each image direction and each mic: (S, P, M)
-        cosang = (u @ self.mic_pos.T).clamp(-1.0, 1.0)
+        cosang = (u @ self.mic_pos.T).clamp(-1.0, 1.0)                 # (S, P, M)
         reflb = self.reflbeta[None] * valid.to(self.rdt)               # (S, P)
 
         H = t.zeros((S, self.M, self.k_total), dtype=self.cdt,
-                    device=self.device)
-        waveNr = self.waveNr                                           # (K,)
+                    device=self.device)                               # sorted bins
+        waveNr = self.waveNr                                           # (K,) sorted
         I = t.tensor(1j, dtype=self.cdt, device=self.device)
+        counts = self.counts
 
         for p0 in range(0, self.P, image_tile):
             p1 = min(p0 + image_tile, self.P)
-            T = p1 - p0
             Rt = R_norm[:, p0:p1]                                      # (S, T)
             cb = cosang[:, p0:p1, :]                                   # (S, T, M)
             rb = reflb[:, p0:p1]                                       # (S, T)
 
-            # z[S, K, T] = waveNr[K] (x) R_norm[S, T]
-            z = waveNr[None, :, None] * Rt[:, None, :]                 # (S, K, T) real
-            z = z.to(self.rdt)
-            zc = z.to(self.cdt)
-            eiz = t.exp(I * zc)
-            invz = 1.0 / zc
+            # z[S, K, T] = waveNr[K] (x) R_norm[S, T]  (sorted bin order). z is
+            # real, so e^{iz}=cos z + i sin z and 1/z is a real reciprocal --
+            # both cheaper than the complex exp / complex division.
+            zr = waveNr[None, :, None] * Rt[:, None, :]                 # (S, K, T) real
+            eiz = t.complex(t.cos(zr), t.sin(zr))
+            invz = (1.0 / zr).to(self.cdt)
             # spherical Hankel h_0, h_1 (first kind)
             h_prev = eiz * invz / I                                    # h_0 = e^{iz}/(iz)
             h_curr = -I * (-I * invz + invz * invz) * eiz              # h_1
@@ -300,38 +314,42 @@ class SmirArray:
             p_prev = t.ones_like(cb)                                   # P_0 = 1
             p_curr = cb.clone()                                        # P_1 = x
 
-            # accumulate l = 0
-            H += self._contract(0, h_prev, p_prev, rb)
+            self._contract(H, 0, h_prev, p_prev, rb, counts[0])
             if self.N_max >= 1:
-                H += self._contract(1, h_curr, p_curr, rb)
+                self._contract(H, 1, h_curr, p_curr, rb, counts[1])
 
             for l in range(2, self.N_max + 1):
-                a = (2 * l - 1)
-                h_next = a * invz * h_curr - h_prev
+                na = counts[l]                                         # active bins
+                if na == 0:
+                    break
+                a = 2 * l - 1
+                # recurrence on the active prefix only
+                h_next = a * invz[:, :na] * h_curr[:, :na] - h_prev[:, :na]
                 p_next = ((2 * l - 1) * cb * p_curr - (l - 1) * p_prev) / l
-                H += self._contract(l, h_next, p_next, rb)
-                h_prev, h_curr = h_curr, h_next
+                self._contract(H, l, h_next, p_next, rb, na)
+                h_prev, h_curr = h_curr[:, :na], h_next
                 p_prev, p_curr = p_curr, p_next
-        return H
 
-    def _contract(self, l, hank_l, p_l, rb):
-        """One harmonic order's contribution: bmm over the image-tile axis.
+        # un-sort: H[..., perm] = H_sorted
+        H_out = t.empty_like(H)
+        H_out.index_copy_(2, self.perm, H)
+        return H_out
 
-        hank_l: (S, K, T) complex   p_l: (S, T, M) real   rb: (S, T) real
-        returns (S, M, K) complex.
+    def _contract(self, H, l, hank_l, p_l, rb, na):
+        """Add order ``l``'s contribution into ``H[:, :, :na]`` in place.
+
+        hank_l: (S, na, T) complex   p_l: (S, T, M) real   rb: (S, T) real
         """
+        if na == 0:
+            return
         t = self.torch
         # A[S, M, T] = (2l+1) * P_l * reflbeta
-        A = (self.l_factor[l] * p_l * rb[:, :, None]).transpose(1, 2)  # (S, M, T)
-        A = A.to(self.cdt)
-        # Zero the Hankel at frequencies where order l is above the per-bin
-        # truncation, before multiplying, so overflowed/NaN masked entries do
-        # not contaminate the sum (those terms are physically negligible).
-        hk = t.where(self.order_active[None, :, l, None], hank_l,
-                     t.zeros((), dtype=self.cdt, device=hank_l.device))
-        # B[S, T, K] = hank_l^T * shd_k_l[:, l]
-        B = hk.transpose(1, 2) * self.shd_k_l[:, l][None, None, :]      # (S, T, K)
-        return t.bmm(A, B)                                              # (S, M, K)
+        A = (self.l_factor[l] * p_l * rb[:, :, None]).transpose(1, 2).to(self.cdt)
+        # Contract the image-tile axis t first, then apply the per-frequency
+        # mode-strength factor on the small (S, M, na) result instead of on the
+        # large (S, na, T) Hankel tensor (all bins here are active -> no mask).
+        contrib = t.einsum("smt,snt->smn", A, hank_l)                   # (S, M, na)
+        H[:, :, :na] += contrib * self.shd_k_l[:na, l][None, None, :]
 
     def _apply_hp(self, h):
         """4th-order 50 Hz Butterworth high-pass, matching scipy.lfilter.

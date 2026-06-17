@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.8.0
+- **`SmirArray` GPU backend ~3x faster** (output unchanged: ~1e-7 in
+  complex128, ~1.5e-5 in complex64). Two pure-backend optimisations:
+  - *Frequency-order slicing*: frequency bins are sorted by their required
+    spherical-harmonic order ``n_per`` at construction, so as the per-order
+    recurrence climbs only the still-active prefix of bins is processed (low
+    frequencies drop out early). This also removes the old inf*0->NaN mask.
+  - *Contraction reorder*: the per-frequency mode-strength factor is now applied
+    to the small ``(S, M, n_active)`` contracted result instead of the large
+    ``(S, n_active, T)`` Hankel tensor, saving a full-size pass per order.
+  - The spherical Hankel seed now uses ``cos``/``sin`` and a real reciprocal
+    instead of complex ``exp``/division.
+  - Note: a multiplicative order rule (``order_per_freq(..., factor=1.5)``)
+    keeps low-frequency orders small and lets the slicing skip more work, for a
+    further speedup at a small accuracy cost — tune to taste.
+
 ## 2.7.1
 - **`SmirArray.generate(..., return_H=True)`**: optionally also return the
   one-sided complex transfer function ``H`` of shape ``(N, M, K*nsample/2+1)``,
