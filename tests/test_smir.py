@@ -110,3 +110,24 @@ def test_batch_return_H_and_edge_cases():
     assert len(one) == 1 and one[0].ndim == 2
     tup = smir_generator_batch([dict(s=SRC)], return_H=True, **common)
     assert len(tup[0]) == 3
+
+
+@pytest.mark.parametrize("sphType", ["open", "rigid"])
+@pytest.mark.parametrize("dtype,tol", [("complex128", 1e-5), ("complex64", 5e-4)])
+def test_torch_backend_matches_reference(sphType, dtype, tol):
+    """SmirArray (GPU backend, run here on CPU) matches smir_generator."""
+    torch = pytest.importorskip("torch")
+    from smirgen import SmirArray
+    r = 0.042
+    mic = [[np.pi / 4, np.pi / 2], [np.pi / 2, np.pi / 3]]
+    freq = np.fft.rfftfreq(256, 1 / FS)
+    N_harm = order_per_freq(freq, C, r, margin=6, n_max=20)
+    srcs = [[3.37, 4.05, 1.7], [2.5, 3.0, 2.1], [4.0, 5.0, 1.2]]
+    common = dict(c=C, procFs=FS, sphLocation=REC, L=L, beta=0.3,
+                  sphType=sphType, sphRadius=r, mic=mic, N_harm=N_harm,
+                  nsample=256, K=1, order=-1, HP=1, fmin=5)
+    ref = np.stack([smir_generator(s=s, **common)[0] for s in srcs])
+    arr = SmirArray(device="cpu", dtype=dtype, **common)
+    got = arr.generate(srcs, source_batch=2, image_tile=600)
+    assert got.shape == ref.shape
+    assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < tol

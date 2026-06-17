@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.7.0
+- **GPU backend `SmirArray` (PyTorch)**: fast-path dataset generation on the GPU
+  for the common case where the room, array centre, microphones and radius are
+  **fixed** and only the **source position** varies. Covers spherical arrays
+  (open/rigid), omnidirectional sources and real reflection coefficients.
+  Source-independent state (mode strength, wavenumber grid, image-source lattice
+  and reflection factors) is precomputed once on the host; per-source work — the
+  Hankel/Legendre expansion summed over images — runs as batched matmuls plus a
+  batched inverse FFT. Construct once, then ``arr.generate(sources)`` returns
+  ``(N, M, nsample)``.
+  - Image lattice is exactly pruned at construction to the cells reachable by
+    some in-room source (typically ~2.5x fewer candidates).
+  - Output matches `smir_generator` to ~1e-7 in `complex128` and ~1.5e-5 in the
+    default `complex64` (faster / half the memory on GPU). The 50 Hz high-pass
+    is always applied in float64 (its poles sit at z≈1, so float32 is unstable).
+  - Requires PyTorch (`pip install smirgen[gpu]`); the import is lazy so the
+    rest of the package works without torch.
+
 ## 2.6.0
 - **`smir_generator_batch`**: generate many RIRs in parallel for dataset
   building. Each RIR is an independent `smir_generator` call whose native

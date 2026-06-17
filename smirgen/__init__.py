@@ -19,8 +19,9 @@ from .generator import smir_generator, smir_generator_batch, order_per_freq
 from .coords import sph2cart, cart2sph
 from .plotting import plot_geometry
 from .analysis import relative_db, direct_reference
+from .torch_gen import SmirArray            # GPU backend (torch imported lazily)
 
 __all__ = ["smir_generator", "smir_generator_batch", "order_per_freq",
            "sph2cart", "cart2sph", "plot_geometry", "relative_db",
-           "direct_reference"]
-__version__ = "2.6.0"
+           "direct_reference", "SmirArray"]
+__version__ = "2.7.0"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smirgen"
-version = "2.6.0"
+version = "2.7.0"
 description = "Spherical Microphone array Impulse Response generator (Python port of SMIRgen, with a native pybind11 core)"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -27,6 +27,7 @@ classifiers = [
 
 [project.optional-dependencies]
 plot = ["matplotlib"]
+gpu = ["torch"]
 test = ["pytest", "matplotlib"]
 
 # After creating the GitHub repo, fill in the real URL:
