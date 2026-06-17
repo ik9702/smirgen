@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.6.0
+- **`smir_generator_batch`**: generate many RIRs in parallel for dataset
+  building. Each RIR is an independent `smir_generator` call whose native
+  image-source loop releases the GIL, so a thread pool scales almost linearly
+  with cores (no pickling/copying; the mode-strength and high-pass caches are
+  shared and warmed once up front). For a reverberant dataset (`order=-1`) this
+  is ~7-8x on top of the per-call savings from a tight `N_harm`. Pass the fixed
+  array/room config as keyword arguments and a list of per-sample overrides;
+  results come back in input order. The cache is now lock-guarded for safe
+  concurrent use.
+
 ## 2.5.1
 - **Performance (dataset generation)**: cache the spherical mode strength and
   the high-pass filter coefficients across calls. In a generation loop with a

@@ -15,11 +15,12 @@ Example
 ...     nsample=2048, K=1, order=6, HP=1)
 """
 
-from .generator import smir_generator, order_per_freq
+from .generator import smir_generator, smir_generator_batch, order_per_freq
 from .coords import sph2cart, cart2sph
 from .plotting import plot_geometry
 from .analysis import relative_db, direct_reference
 
-__all__ = ["smir_generator", "order_per_freq", "sph2cart", "cart2sph",
-           "plot_geometry", "relative_db", "direct_reference"]
-__version__ = "2.5.1"
+__all__ = ["smir_generator", "smir_generator_batch", "order_per_freq",
+           "sph2cart", "cart2sph", "plot_geometry", "relative_db",
+           "direct_reference"]
+__version__ = "2.6.0"

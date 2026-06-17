@@ -6,7 +6,8 @@ Run with: pytest
 import numpy as np
 import pytest
 
-from smirgen import smir_generator, order_per_freq, relative_db
+from smirgen import (smir_generator, smir_generator_batch, order_per_freq,
+                     relative_db)
 
 C = 343.0
 FS = 8000.0
@@ -84,3 +85,28 @@ def test_relative_db_anechoic_direct_is_zero():
                               sphRadius=0.042, mic=[[np.pi / 4, np.pi / 2]],
                               N_harm=15, nsample=1024, K=1, order=0)
     assert np.nanmax(np.abs(db)) < 1e-6
+
+
+def test_batch_matches_sequential():
+    """smir_generator_batch returns, in order, exactly the sequential results."""
+    common = dict(c=C, procFs=FS, sphLocation=REC, L=L, beta=0.3,
+                  sphType="rigid", sphRadius=0.042,
+                  mic=[[np.pi / 4, np.pi / 2], [np.pi / 2, np.pi / 2]],
+                  N_harm=15, nsample=1024, K=1, order=-1, HP=1)
+    varying = [dict(s=[3.37 + 0.05 * i, 4.05, 1.7]) for i in range(6)]
+    seq = [smir_generator(**{**common, **v})[0] for v in varying]
+    bat = smir_generator_batch(varying, n_workers=4, **common)
+    assert len(bat) == len(varying)
+    for a, b in zip(seq, bat):
+        assert np.array_equal(a, b)
+
+
+def test_batch_return_H_and_edge_cases():
+    common = dict(c=C, procFs=FS, sphLocation=REC, L=L, beta=ANECHOIC,
+                  sphType="open", sphRadius=0.0, mic=[[0, 0]], N_harm=0,
+                  nsample=512, K=1, order=0, HP=0)
+    assert smir_generator_batch([], **common) == []
+    one = smir_generator_batch([dict(s=SRC)], **common)
+    assert len(one) == 1 and one[0].ndim == 2
+    tup = smir_generator_batch([dict(s=SRC)], return_H=True, **common)
+    assert len(tup[0]) == 3

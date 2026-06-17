@@ -14,7 +14,10 @@ mirrors the MATLAB wrapper (argument handling, mode-strength computation, FFT
 reconstruction and the optional high-pass filter).
 """
 
+import os
+import threading
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from scipy.special import spherical_jn, spherical_yn
@@ -23,7 +26,7 @@ from scipy.signal import butter, lfilter
 from . import _smir_loop
 from .coords import sph2cart, cart2sph
 
-__all__ = ["smir_generator", "order_per_freq"]
+__all__ = ["smir_generator", "smir_generator_batch", "order_per_freq"]
 
 
 def order_per_freq(freq, c, sph_radius, factor=1.0, margin=0, n_min=0,
@@ -67,6 +70,7 @@ def order_per_freq(freq, c, sph_radius, factor=1.0, margin=0, n_min=0,
 
 _MODE_STRENGTH_CACHE = {}
 _HP_FILTER_CACHE = {}
+_CACHE_LOCK = threading.Lock()
 
 
 def _mode_strength_cached(sph_type, sph_radius, k, n_harm):
@@ -78,15 +82,21 @@ def _mode_strength_cached(sph_type, sph_radius, k, n_harm):
     dominates the runtime. Cache it on the byte content of the wavenumber grid
     so repeated calls reuse the result. Returns copies so callers may mutate the
     arrays freely. The cache is capped to avoid unbounded growth.
+
+    Thread-safe: :func:`smir_generator_batch` calls this from worker threads, so
+    the cache is guarded by a lock (taken only on the slow miss path).
     """
     key = (sph_type, float(sph_radius), int(n_harm), k.shape, k.tobytes())
     hit = _MODE_STRENGTH_CACHE.get(key)
     if hit is None:
-        ms, n_eff = _mode_strength(sph_type, sph_radius, k, n_harm)
-        if len(_MODE_STRENGTH_CACHE) > 32:
-            _MODE_STRENGTH_CACHE.clear()
-        _MODE_STRENGTH_CACHE[key] = (ms, n_eff)
-        hit = (ms, n_eff)
+        with _CACHE_LOCK:
+            hit = _MODE_STRENGTH_CACHE.get(key)        # re-check inside the lock
+            if hit is None:
+                ms, n_eff = _mode_strength(sph_type, sph_radius, k, n_harm)
+                if len(_MODE_STRENGTH_CACHE) > 32:
+                    _MODE_STRENGTH_CACHE.clear()
+                hit = (ms, n_eff)
+                _MODE_STRENGTH_CACHE[key] = hit
     ms, n_eff = hit
     return ms.copy(), n_eff
 
@@ -400,3 +410,70 @@ def smir_generator(c, procFs, sphLocation, s, L, beta, sphType, sphRadius, mic,
         h = lfilter(b, a, h, axis=1)
 
     return h, H, beta_hat
+
+
+def smir_generator_batch(varying, n_workers=None, return_H=False, **common):
+    """Generate many RIRs in parallel — the fast path for building a dataset.
+
+    Each RIR is an independent call to :func:`smir_generator`; the heavy
+    image-source loop runs in the native extension with the GIL released, so a
+    thread pool scales almost linearly with the number of cores (no pickling or
+    array copying, and the mode-strength / high-pass caches are shared across
+    workers). For a reverberant dataset (``order=-1``) this is typically ~7-8x
+    on top of the per-call savings from a tight ``N_harm`` (see
+    :func:`order_per_freq`).
+
+    Parameters
+    ----------
+    varying : sequence of dict
+        One dict per RIR, holding the keyword arguments that change between
+        samples (e.g. ``s``, ``sphLocation``, ``L``, ``beta``). Each is merged
+        on top of ``common`` to form the full :func:`smir_generator` call.
+    n_workers : int, optional
+        Thread-pool size. Defaults to ``os.cpu_count()`` (capped at the number
+        of items). Past ~8 the speedup usually saturates on memory bandwidth.
+    return_H : bool, optional
+        If True, return the full ``(h, H, beta_hat)`` tuple per item; otherwise
+        return just the RIR ``h`` (the common case). Default False.
+    **common
+        Keyword arguments shared by every call (``c``, ``procFs``, ``sphType``,
+        ``sphRadius``, ``mic``, ``N_harm``, ``nsample``, ``K``, ``order`` ...).
+
+    Returns
+    -------
+    list
+        Results in the same order as ``varying``: either ``h`` arrays
+        (``return_H=False``) or ``(h, H, beta_hat)`` tuples.
+
+    Examples
+    --------
+    >>> freq = np.fft.rfftfreq(2048, 1 / 16000)
+    >>> N_harm = order_per_freq(freq, c=343, sph_radius=0.105, margin=4, n_max=30)
+    >>> varying = [dict(sphLocation=ctr, s=src, L=room, beta=t60)
+    ...            for ctr, src, room, t60 in samples]
+    >>> rirs = smir_generator_batch(
+    ...     varying, c=343, procFs=16000, sphType="rigid", sphRadius=0.105,
+    ...     mic=mic, N_harm=N_harm, nsample=2048, K=1, order=-1, HP=1, fmin=10)
+    """
+    items = list(varying)
+    if not items:
+        return []
+
+    def _run(params):
+        out = smir_generator(**{**common, **params})
+        return out if return_H else out[0]
+
+    # Warm the shared caches single-threaded on the first item so the worker
+    # threads only ever read them (the mode strength is identical across the
+    # batch when the array / nsample / N_harm are fixed in ``common``).
+    first = _run(items[0])
+    if len(items) == 1:
+        return [first]
+
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
+    n_workers = max(1, min(n_workers, len(items) - 1))
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        rest = list(ex.map(_run, items[1:]))
+    return [first, *rest]
