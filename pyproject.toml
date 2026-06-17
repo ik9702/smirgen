@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smirgen"
-version = "2.7.0"
+version = "2.7.1"
 description = "Spherical Microphone array Impulse Response generator (Python port of SMIRgen, with a native pybind11 core)"
 readme = "README.md"
 requires-python = ">=3.8"

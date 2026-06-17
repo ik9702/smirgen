@@ -127,7 +127,10 @@ def test_torch_backend_matches_reference(sphType, dtype, tol):
                   sphType=sphType, sphRadius=r, mic=mic, N_harm=N_harm,
                   nsample=256, K=1, order=-1, HP=1, fmin=5)
     ref = np.stack([smir_generator(s=s, **common)[0] for s in srcs])
+    refH = np.stack([smir_generator(s=s, **common)[1] for s in srcs])
     arr = SmirArray(device="cpu", dtype=dtype, **common)
-    got = arr.generate(srcs, source_batch=2, image_tile=600)
+    got, gotH = arr.generate(srcs, source_batch=2, image_tile=600, return_H=True)
     assert got.shape == ref.shape
+    assert gotH.shape == refH.shape
     assert np.linalg.norm(got - ref) / np.linalg.norm(ref) < tol
+    assert np.linalg.norm(gotH - refH) / np.linalg.norm(refH) < tol

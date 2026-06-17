@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.7.1
+- **`SmirArray.generate(..., return_H=True)`**: optionally also return the
+  one-sided complex transfer function ``H`` of shape ``(N, M, K*nsample/2+1)``,
+  matching :func:`smir_generator`'s ``H`` output (to ~1e-8 in complex128). The
+  RIR ``h`` is still returned first; ``return_H`` is off by default.
+
 ## 2.7.0
 - **GPU backend `SmirArray` (PyTorch)**: fast-path dataset generation on the GPU
   for the common case where the room, array centre, microphones and radius are

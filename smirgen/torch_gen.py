@@ -202,7 +202,7 @@ class SmirArray:
 
     # -----------------------------------------------------------------------
     def generate(self, sources, source_batch=16, image_tile=4096,
-                 return_numpy=True):
+                 return_numpy=True, return_H=False):
         """Generate RIRs for many source positions.
 
         Parameters
@@ -217,11 +217,17 @@ class SmirArray:
         return_numpy : bool
             Return a NumPy array (default) or leave the result on-device as a
             torch tensor.
+        return_H : bool
+            If True, also return the one-sided complex transfer function ``H``
+            of shape ``(N, M, K*nsample/2 + 1)`` (matching :func:`smir_generator`
+            output ``H``). Default False.
 
         Returns
         -------
-        (N, M, nsample) array
+        h : (N, M, nsample) array
             Room impulse responses, matching :func:`smir_generator` output ``h``.
+        H : (N, M, K*nsample/2 + 1) array, optional
+            Returned only when ``return_H=True``.
         """
         t = self.torch
         sources = np.asarray(sources, float).reshape(-1, 3)
@@ -231,6 +237,8 @@ class SmirArray:
         sph_samp = self.sphRadius / self.cTs
         out = t.empty((N, self.M, self.nsample), dtype=self.rdt,
                       device=self.device)
+        H_out = (t.empty((N, self.M, self.k_total), dtype=self.cdt,
+                         device=self.device) if return_H else None)
 
         for b0 in range(0, N, source_batch):
             sb = s_samp[b0:b0 + source_batch]                          # (S, 3)
@@ -238,6 +246,8 @@ class SmirArray:
             H = self._accumulate(sb, S, sph_samp, image_tile)          # (S, M, K) complex
             H = t.nan_to_num(H)
             H = t.conj(H)
+            if return_H:
+                H_out[b0:b0 + S] = H
             h = t.fft.irfft(H, n=self.N_FFT, dim=-1)[..., :self.nsample]
             out[b0:b0 + S] = h
 
@@ -245,8 +255,10 @@ class SmirArray:
             out = self._apply_hp(out)
 
         if return_numpy:
-            return out.detach().cpu().numpy()
-        return out
+            out = out.detach().cpu().numpy()
+            if return_H:
+                H_out = H_out.detach().cpu().numpy()
+        return (out, H_out) if return_H else out
 
     # -----------------------------------------------------------------------
     def _accumulate(self, sb, S, sph_samp, image_tile):
