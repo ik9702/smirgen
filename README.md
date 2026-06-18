@@ -22,6 +22,9 @@ loop is kept in native C++ (via **pybind11**); the rest is NumPy/SciPy, so
 - **Frequency-dependent spherical-harmonic order** (`N_harm` as scalar, per-bin
   array, or callable) — more physical and faster.
 - **`fmin`** option to avoid the DC singularity.
+- **Fast dataset generation**: multi-threaded CPU batches (`smir_generator_batch`)
+  and a **GPU (PyTorch) backend** (`SmirArray`) for the fixed-array /
+  varying-source workload — see [Fast dataset generation](#fast-dataset-generation).
 - Source/direct-referenced level analysis (`relative_db`).
 - 3D geometry visualisation (`plot_geometry`), notebook-friendly.
 
@@ -36,6 +39,7 @@ pip install .                 # from the repository root
 pip install -e .
 # optional extras:
 pip install ".[plot,test]"    # matplotlib, pytest
+pip install ".[gpu]"          # PyTorch, for the SmirArray GPU backend
 ```
 
 Verify:
@@ -122,6 +126,87 @@ fig, ax = plot_geometry(L=[5,6,4], sphLocation=[1.6,4.05,1.7], s=[3.37,4.05,1.7]
 Or `smir_generator(..., plot_geometry=True)`. It is a one-off inspection aid
 (building the figure costs far more than the simulation) — keep it off in loops.
 In Jupyter it displays inline without blocking.
+
+## Fast dataset generation
+
+For building datasets you usually call the generator many times. Two helpers
+make this fast; both return results **identical** to `smir_generator`.
+
+### CPU — `smir_generator_batch`
+
+Each RIR is independent and the native loop releases the GIL, so a thread pool
+scales almost linearly. Pass the fixed config as keyword arguments and a list of
+per-sample overrides; results come back in input order.
+
+```python
+from smirgen import smir_generator_batch, order_per_freq
+import numpy as np
+
+freq   = np.fft.rfftfreq(2048, 1/16000)
+N_harm = order_per_freq(freq, c=343, sph_radius=0.1, margin=10, n_max=30)
+
+varying = [dict(s=src) for src in source_positions]      # only the source varies
+rirs = smir_generator_batch(                              # list of h, input order
+    varying, n_workers=8,
+    c=343, procFs=16000, sphLocation=center, L=room, beta=0.3,
+    sphType="rigid", sphRadius=0.1, mic=mic, N_harm=N_harm,
+    nsample=2048, K=1, order=-1, HP=1, fmin=10)
+# return_H=True -> list of (h, H, beta_hat) instead of just h
+```
+
+### GPU — `SmirArray` (PyTorch)
+
+Specialised for the common case where the **room, array centre, microphones and
+radius are fixed and only the source position varies**. Source-independent state
+is precomputed once; the per-source spherical-harmonic sum runs as batched
+matmuls plus a batched inverse FFT. Fast-path scope: spherical array
+(open/rigid), **omnidirectional source**, **real reflection coefficients**.
+
+```python
+from smirgen import SmirArray, order_per_freq
+import numpy as np
+
+freq   = np.fft.rfftfreq(2048, 1/16000)
+N_harm = order_per_freq(freq, c=343, sph_radius=0.1, margin=10, n_max=30)
+
+arr = SmirArray(                       # build once for the fixed array/room
+    c=343, procFs=16000, sphLocation=center, L=room, beta=0.3,
+    sphType="rigid", sphRadius=0.1, mic=mic, N_harm=N_harm,
+    nsample=2048, K=1, order=-1, HP=0, fmin=10,
+    device="cuda", dtype="complex64")  # device="cuda:1" to pick a GPU
+
+h = arr.generate(source_positions,     # (N, 3) array of source positions
+                 source_batch=64,      # sources processed together (↑ throughput)
+                 image_tile=8192)      # images per tile (caps peak memory)
+# h:           (N, M, nsample)
+# return_H=True -> (h, H) with H of shape (N, M, K*nsample/2+1)
+# return_numpy=False -> leave results on-device as torch tensors
+```
+
+- `source_batch` and `image_tile` trade memory for speed; peak memory ≈
+  `source_batch · k_total · image_tile` complex numbers. On `CUDA out of memory`,
+  lower `image_tile` first. `arr.P` is the (pruned) candidate-image count.
+- For multiple GPUs, build one `SmirArray` per `device="cuda:i"` and split the
+  sources across them.
+
+### Precision: `complex64` vs `complex128`
+
+`SmirArray` matches `smir_generator` to **~1e-7** in `complex128` and **~1.5e-5**
+in the default `complex64`. The float32 path is only safe up to spherical-harmonic
+**order ≈ 25**; above that the rigid Hankel recurrence loses precision and
+`complex64` silently degrades (tens of %). Two things push the required order up:
+
+- **Large additive `N_harm` margin** (e.g. `margin=30` → order ~45): unnecessary
+  for convergence and breaks `complex64`. `margin≈10` (order ~25) is converged
+  for a mid-radius array and float32-safe.
+- **Sources very close to the sphere surface** (near field): convergence needs a
+  large *constant* order (~`ln(1/ε)/ln(R/r)` extra, with `R` the source distance
+  and `r` the radius). A source ~1 cm off a 10 cm sphere needs order ~70 → use
+  `complex128` (and `margin≈60`). Keep sources ≳2–3 cm off the surface to stay in
+  the `complex64`-safe, low-order regime.
+
+In short: **omni source, real coefficients, fixed array, sources not hugging the
+surface → `complex64`; otherwise `complex128`.** `HP` only affects `h`, never `H`.
 
 ## Conventions
 
