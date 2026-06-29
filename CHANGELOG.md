@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.9.0
+- **Hybrid ISM + statistical-tail generation (`smir_generator_hybrid`)** for
+  long RIRs in large, reverberant rooms, where the pure image method is
+  expensive (image count grows as ``~T60**3 * c**3 / V``). The exact early part
+  is computed by the image method up to a bounded reflection ``order``; past the
+  mixing time it is replaced by a fast diffuse-field noise tail whose
+  inter-microphone coherence matches the array's diffuse coherence (open
+  sphere: ``sinc(k d)``; rigid sphere: the mode-strength-weighted Legendre sum,
+  reusing the cached mode strength) and whose energy decays at the room's T60.
+  The two are crossfaded at the mixing time. Output is **not** sample-identical
+  to a full image-source RIR — the tail matches only in T60 and spatial-
+  coherence statistics, which is the right trade-off for ML datasets
+  (dereverberation / source separation). On a 10x8x4 m, T60=0.8 s room this is
+  ~260x faster than a full ``order=-1`` RIR.
+- **`hybrid_params(L, rt60, sphRadius, ...)`**: pyroomacoustics-style automatic
+  parameter selection — from the room dimensions and target T60 it returns a
+  ready-to-splat keyword dict (reflection coefficient, RIR length, mixing time,
+  early reflection order via ``c*mix_time/min(L)``, and a frequency-matched
+  ``N_harm``). ``smir_generator_hybrid`` also auto-derives ``early_order`` when
+  it is left as ``None``.
+
 ## 2.8.0
 - **`SmirArray` GPU backend ~3x faster** (output unchanged: ~1e-7 in
   complex128, ~1.5e-5 in complex64). Two pure-backend optimisations:

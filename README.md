@@ -25,6 +25,9 @@ loop is kept in native C++ (via **pybind11**); the rest is NumPy/SciPy, so
 - **Fast dataset generation**: multi-threaded CPU batches (`smir_generator_batch`)
   and a **GPU (PyTorch) backend** (`SmirArray`) for the fixed-array /
   varying-source workload — see [Fast dataset generation](#fast-dataset-generation).
+- **Hybrid generation for long RIRs in large rooms** (`smir_generator_hybrid`):
+  exact early reflections + a fast diffuse-field statistical tail, ~100–300×
+  faster for long, reverberant RIRs — see [Long RIRs](#long-rirs--hybrid-generation).
 - Source/direct-referenced level analysis (`relative_db`).
 - 3D geometry visualisation (`plot_geometry`), notebook-friendly.
 
@@ -208,6 +211,54 @@ in the default `complex64`. The float32 path is only safe up to spherical-harmon
 In short: **omni source, real coefficients, fixed array, sources not hugging the
 surface → `complex64`; otherwise `complex128`.** `HP` only affects `h`, never `H`.
 
+## Long RIRs — hybrid generation
+
+The pure image-source method places every reflection exactly, but the image
+count grows with the **cube of the RIR length** (`~ T60³·c³/V`). In a large,
+reverberant room a long, fully geometric RIR is therefore expensive — the
+bottleneck even on the GPU backend.
+
+`smir_generator_hybrid` keeps the cheap, exact **early** part from the image
+method (up to a bounded reflection order) and replaces the expensive **late
+tail** with a fast statistical model: a multichannel diffuse-field noise whose
+**inter-microphone coherence matches the array's diffuse coherence** (open
+sphere: `sinc(k·d)`; rigid sphere: the mode-strength-weighted Legendre sum) and
+whose energy decays at the room's T60. The two are crossfaded at the mixing
+time.
+
+```python
+from smirgen import hybrid_params, smir_generator_hybrid
+import numpy as np
+
+mic = np.array([[0, np.pi/2], [2*np.pi/3, np.pi/2], [4*np.pi/3, np.pi/2], [0, 0.0]])
+
+# Room dimensions + target T60 -> all the right parameters (pyroomacoustics-style).
+kw = hybrid_params(L=[10, 8, 4], rt60=0.8, sphRadius=0.042,
+                   procFs=16000, sphType="rigid")
+# kw["info"] -> {'beta_hat', 'mix_time_ms', 'early_order', 'full_order', 'nsample'}
+#   e.g. early_order=4  vs  full_order≈69 a full geometric RIR would need.
+
+h, beta_hat = smir_generator_hybrid(
+    sphLocation=[5, 4, 1.7], s=[2, 6, 1.5], mic=mic, seed=0, **kw)
+# h: (M, nsample). ~260× faster than smir_generator(order=-1) for this room.
+```
+
+You can also call it directly; `early_order=None` (the default) is auto-derived
+from the mixing time and room size, or set it yourself (larger → more of the RIR
+is geometric / slower / more accurate). Other knobs: `mix_time` (crossover, s),
+`tail_gain` (seam-level calibration), `xfade_ms`, `seed` (reproducible tails),
+and `return_parts=True` to inspect the early RIR, tail and mixing sample.
+
+> **Not sample-identical to a full image-source RIR.** The tail is a
+> statistically-matched realisation — equal to the geometric tail only in its
+> **energy-decay (T60)** and **spatial-coherence** statistics. That is the right
+> trade-off for dereverberation / source-separation **training data**, where
+> those statistics, not the exact late echo pattern, are what matter. The diffuse
+> coherence-constrained noise follows Habets, Cohen & Gannot, *"Generating
+> nonstationary multisensor signals under a spatial coherence constraint"*, JASA
+> 124(5), 2008. Scalar T60 or 6 real reflection coefficients only (no
+> angle-dependent walls in the tail).
+
 ## Conventions
 
 - Angles are **(azimuth, inclination)** in radians, inclination from the **+z
@@ -221,7 +272,7 @@ surface → `complex64`; otherwise `complex128`.** `HP` only affects `h`, never 
 
 | Path | Purpose |
 |------|---------|
-| `smirgen/` | the package (generator, coords, plotting, analysis) |
+| `smirgen/` | the package (generator, hybrid, torch_gen, coords, plotting, analysis) |
 | `smir_loop.cpp` | pybind11 port of the MEX image-source core |
 | `examples/example.py` | port of `run_smir_generator.m` |
 | `tests/` | pytest correctness tests |
