@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.10.0
+- **GPU-batch hybrid generation: `SmirArray(..., tail="diffuse")`**. The diffuse
+  statistical tail (see 2.9.0) now runs in the PyTorch backend, so long,
+  reverberant RIR datasets can be built on the GPU. The image method is computed
+  only up to a bounded ``early_order`` (auto-derived from the mixing time) and
+  the late tail — a diffuse-field noise with the array's diffuse coherence and
+  the room T60 decay — is synthesised as batched matmuls + a batched inverse FFT.
+  The diffuse coherence is source-independent and precomputed once; only the
+  per-source noise and seam level vary. ``generate(sources, seed=...)`` gives
+  reproducible tails. Validated (CPU torch): early part matches the native
+  bounded-order ISM to ~1e-8 (complex128), tail T60 and stationary spatial
+  coherence match theory. ``tail=None`` (full ISM) is unchanged; ``return_H`` is
+  not supported with the tail.
+- **`smir_generator_hybrid_batch`**: multi-threaded CPU batch of
+  `smir_generator_hybrid` (hybrid analogue of `smir_generator_batch`), with a
+  per-item `base_seed + index` so tails are reproducible and distinct.
+
 ## 2.9.0
 - **Hybrid ISM + statistical-tail generation (`smir_generator_hybrid`)** for
   long RIRs in large, reverberant rooms, where the pure image method is

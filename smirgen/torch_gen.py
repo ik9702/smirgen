@@ -27,6 +27,17 @@ Typical use::
                     nsample=2048, K=1, order=-1, HP=1, fmin=10, device="cuda")
     h = arr.generate(source_positions)        # (N, M, nsample) torch tensor
 
+Hybrid mode (``tail="diffuse"``) builds long, reverberant RIRs cheaply on the
+GPU: the image method is computed only up to a bounded ``early_order`` (covering
+the mixing time) and the late tail is filled with a diffuse-field statistical
+model — the GPU-batched analogue of :func:`smirgen.smir_generator_hybrid`. The
+diffuse coherence is source-independent and precomputed once; only the per-source
+noise and seam level vary. Use this to generate datasets for long T60 where the
+full image method would be prohibitively expensive::
+
+    arr = SmirArray(..., nsample=11200, tail="diffuse", device="cuda")
+    h = arr.generate(source_positions, seed=0)   # exact early + statistical tail
+
 Requires PyTorch (CPU or CUDA). Import is lazy so the rest of ``smirgen`` works
 without torch installed.
 """
@@ -35,6 +46,8 @@ import numpy as np
 
 from .coords import sph2cart, cart2sph
 from .generator import order_per_freq, _mode_strength_cached
+from .hybrid import (_diffuse_coherence, _mixing_time, _auto_early_order,
+                     _t60_from_room)
 
 
 def _build_shd_k_l(sphType, sphRadius, waveNr, n_per):
@@ -60,13 +73,16 @@ class SmirArray:
 
     def __init__(self, c, procFs, sphLocation, L, beta, sphType, sphRadius, mic,
                  N_harm, nsample, K=1, order=-1, HP=0, fmin=0.0,
-                 device="cuda", dtype="complex64"):
+                 tail=None, early_order=None, mix_time=None, tail_gain=1.0,
+                 xfade_ms=2.0, device="cuda", dtype="complex64"):
         import torch
 
         if sphType not in ("open", "rigid"):
             raise ValueError("sphType must be 'open' or 'rigid'.")
         if sphRadius <= 0:
             raise ValueError("torch_gen requires a spherical array (sphRadius>0).")
+        if tail not in (None, "diffuse"):
+            raise ValueError("tail must be None or 'diffuse'.")
 
         self.torch = torch
         self.device = torch.device(device)
@@ -85,18 +101,40 @@ class SmirArray:
         L = np.asarray(L, float).reshape(3)
         beta = np.asarray(beta, float).reshape(-1)
 
-        # ---- reflection coefficients (scalar T60 -> 6 walls) ----------------
+        # ---- reflection coefficients (scalar T60 -> 6 walls) and T60 --------
+        Vol = L[0] * L[1] * L[2]
         if beta.size == 1:
-            V = L[0] * L[1] * L[2]
             S = 2 * (L[0] * L[2] + L[1] * L[2] + L[0] * L[1])
-            alfa = 24 * V * np.log(10) / (c * S * beta[0])
+            self.T60 = float(beta[0])                       # scalar beta IS T60
+            alfa = 24 * Vol * np.log(10) / (c * S * beta[0])
             if alfa > 1:
                 raise ValueError("Cannot derive reflection coefficients from "
                                  "the given T60/room dimensions.")
             beta = np.full(6, np.sqrt(1 - alfa))
-        elif beta.size != 6:
+        elif beta.size == 6:
+            self.T60 = _t60_from_room(L, beta, c)           # Sabine from walls
+        else:
             raise ValueError("beta must be a scalar (T60) or length-6 vector.")
         self.beta6 = beta
+
+        # ---- hybrid statistical tail: derive mixing time / early order ------
+        # When tail='diffuse' the image method is computed only up to a bounded
+        # 'early_order' (covering the mixing time); the reverberant tail is
+        # filled by a diffuse-field statistical model in generate(). The lattice
+        # is therefore built for early_order, not the full 'order'.
+        self.tail = tail
+        self.tail_gain = float(tail_gain)
+        self._xfade_ms = float(xfade_ms)
+        if tail == "diffuse":
+            self.mix_time = (_mixing_time(Vol) if mix_time is None
+                             else float(mix_time))
+            self.n_mix = int(np.clip(round(self.mix_time * self.procFs),
+                                     1, self.nsample - 1))
+            self.early_order = (_auto_early_order(L, c, procFs, self.mix_time)
+                                if early_order is None else int(early_order))
+            lattice_order = self.early_order
+        else:
+            lattice_order = order
 
         # ---- frequency grid / wavenumbers (host) ----------------------------
         k_total = self.N_FFT // 2 + 1
@@ -142,10 +180,10 @@ class SmirArray:
         reflbeta = (beta[0] ** np.abs(mx - q) * beta[1] ** np.abs(mx) *
                     beta[2] ** np.abs(my - j) * beta[3] ** np.abs(my) *
                     beta[4] ** np.abs(mz - kp) * beta[5] ** np.abs(mz))
-        # reflection-order constraint
-        if order != -1:
+        # reflection-order constraint (early_order when tail='diffuse')
+        if lattice_order != -1:
             okorder = (np.abs(2 * mx - q) + np.abs(2 * my - j) +
-                       np.abs(2 * mz - kp)) <= order
+                       np.abs(2 * mz - kp)) <= lattice_order
             reflbeta = reflbeta * okorder
         reflbeta = reflbeta.astype(float)
 
@@ -208,9 +246,36 @@ class SmirArray:
             from scipy.signal import butter
             self._hp_ba = butter(4, 50 / (self.procFs / 2), btype="high")
 
+        # ---- diffuse-tail state (source-independent, precomputed once) ------
+        # The array's diffuse-field coherence Gamma(f) depends only on the
+        # geometry, so its per-bin mixing factor C(f) (Gamma = C C^H) and the
+        # T60 decay envelope are built here and reused for every source. Only
+        # the random noise and the per-source seam level vary in generate().
+        self.tail_C = self.tail_env = self.tail_fade = None
+        if self.tail == "diffuse":
+            self.n_tail = self.nsample - self.n_mix
+            nfk = np.fft.rfftfreq(self.n_tail, 1.0 / self.procFs)
+            nfk_eff = np.maximum(nfk, fmin) if fmin and fmin > 0 else nfk
+            k_tail = 2 * np.pi * nfk_eff / c
+            gamma = _diffuse_coherence(sphType, sphRadius, mic_pos, k_tail,
+                                       self.N_max)               # (nf, M, M)
+            evals, evecs = np.linalg.eigh(gamma)
+            Cmix = evecs * np.sqrt(np.clip(evals, 0.0, None))[:, None, :]
+            tt = np.arange(self.n_tail) / self.procFs
+            env = np.power(10.0, -3.0 * tt / self.T60)           # sqrt energy decay
+            nx = max(1, int(self._xfade_ms * 1e-3 * self.procFs))
+            nx = min(nx, self.n_tail, self.n_mix)
+            fade = 0.5 * (1 - np.cos(np.pi * np.arange(nx) / nx))
+            self.seam_w = max(1, int(0.005 * self.procFs))
+            self.tail_nx = nx
+            tt_ = torch
+            self.tail_C = tt_.as_tensor(Cmix, dtype=cdt, device=self.device)
+            self.tail_env = tt_.as_tensor(env, dtype=rdt, device=self.device)
+            self.tail_fade = tt_.as_tensor(fade, dtype=rdt, device=self.device)
+
     # -----------------------------------------------------------------------
     def generate(self, sources, source_batch=16, image_tile=4096,
-                 return_numpy=True, return_H=False):
+                 return_numpy=True, return_H=False, seed=None):
         """Generate RIRs for many source positions.
 
         Parameters
@@ -228,7 +293,12 @@ class SmirArray:
         return_H : bool
             If True, also return the one-sided complex transfer function ``H``
             of shape ``(N, M, K*nsample/2 + 1)`` (matching :func:`smir_generator`
-            output ``H``). Default False.
+            output ``H``). Default False. Not supported with ``tail='diffuse'``
+            (the statistical tail is synthesised in the time domain).
+        seed : int, optional
+            Seed for the diffuse-tail RNG (``tail='diffuse'`` only), for
+            reproducible datasets. The exact noise also depends on
+            ``source_batch``; the tail statistics (T60, coherence) do not.
 
         Returns
         -------
@@ -238,6 +308,9 @@ class SmirArray:
             Returned only when ``return_H=True``.
         """
         t = self.torch
+        if return_H and self.tail == "diffuse":
+            raise NotImplementedError(
+                "return_H is not supported with tail='diffuse'.")
         sources = np.asarray(sources, float).reshape(-1, 3)
         N = sources.shape[0]
         s_samp = t.as_tensor(sources / self.cTs, dtype=self.rdt,
@@ -248,6 +321,12 @@ class SmirArray:
         H_out = (t.empty((N, self.M, self.k_total), dtype=self.cdt,
                          device=self.device) if return_H else None)
 
+        gen = None
+        if self.tail == "diffuse":
+            gen = t.Generator(device=self.device)
+            if seed is not None:
+                gen.manual_seed(int(seed))
+
         for b0 in range(0, N, source_batch):
             sb = s_samp[b0:b0 + source_batch]                          # (S, 3)
             S = sb.shape[0]
@@ -257,6 +336,8 @@ class SmirArray:
             if return_H:
                 H_out[b0:b0 + S] = H
             h = t.fft.irfft(H, n=self.N_FFT, dim=-1)[..., :self.nsample]
+            if self.tail == "diffuse":
+                h = self._add_diffuse_tail(h, gen)                     # early + tail
             out[b0:b0 + S] = h
 
         if self.HP == 1:
@@ -267,6 +348,48 @@ class SmirArray:
             if return_H:
                 H_out = H_out.detach().cpu().numpy()
         return (out, H_out) if return_H else out
+
+    # -----------------------------------------------------------------------
+    def _add_diffuse_tail(self, h, gen):
+        """Replace the late part of the early RIRs with a diffuse statistical tail.
+
+        ``h`` is the bounded-``early_order`` RIR batch ``(S, M, nsample)``. Past
+        the mixing sample it is crossfaded into a multichannel diffuse-field
+        noise whose inter-microphone coherence is the precomputed ``tail_C`` and
+        whose energy decays at the room T60. The seam level is matched per source
+        to that source's own early energy. Mirrors :func:`smir_generator_hybrid`,
+        batched over sources on the device.
+        """
+        t = self.torch
+        S, M, _ = h.shape
+        nt, nf = self.n_tail, self.n_tail // 2 + 1
+
+        # Multichannel white spectrum -> impose the array diffuse coherence.
+        re = t.randn(S, nf, M, generator=gen, device=self.device, dtype=self.rdt)
+        im = t.randn(S, nf, M, generator=gen, device=self.device, dtype=self.rdt)
+        white = t.complex(re, im) / np.sqrt(2.0)                       # (S, nf, M)
+        mixed = t.einsum("fij,sfj->sfi", self.tail_C, white)          # (S, nf, M)
+        noise = t.fft.irfft(mixed.transpose(1, 2), n=nt, dim=-1)      # (S, M, nt)
+
+        # Unit per-source power, then the common T60 decay envelope.
+        rms = noise.pow(2).mean(dim=(-1, -2), keepdim=True).sqrt().clamp_min(1e-30)
+        noise = (noise / rms) * self.tail_env.view(1, 1, -1)
+
+        # Match the tail's seam level to each source's early RMS before the mix.
+        nmix, w = self.n_mix, self.seam_w
+        seam = h[..., max(0, nmix - w):nmix].pow(2).mean(dim=(-1, -2)).sqrt()  # (S,)
+        tail0 = noise[..., :w].pow(2).mean(dim=(-1, -2)).sqrt().clamp_min(1e-30)
+        noise = noise * (self.tail_gain * (seam / tail0)).view(-1, 1, 1)
+
+        # Crossfade: early tail down, diffuse tail up, at the mixing sample.
+        nx, fade = self.tail_nx, self.tail_fade
+        out = h.clone()
+        out[..., nmix - nx:nmix] *= (1 - fade).view(1, 1, -1)
+        out[..., nmix:] = 0
+        tf = noise.clone()
+        tf[..., :nx] *= fade.view(1, 1, -1)
+        out[..., nmix:] += tf[..., :out.shape[-1] - nmix]
+        return out
 
     # -----------------------------------------------------------------------
     def _accumulate(self, sb, S, sph_samp, image_tile):

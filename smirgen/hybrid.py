@@ -35,12 +35,16 @@ envelope is a real per-sample gain and so leaves the inter-channel coherence
 unchanged).
 """
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
 from .generator import smir_generator, _mode_strength_cached, order_per_freq
 from .coords import sph2cart
 
-__all__ = ["smir_generator_hybrid", "hybrid_params"]
+__all__ = ["smir_generator_hybrid", "smir_generator_hybrid_batch",
+           "hybrid_params"]
 
 
 def _mixing_time(V):
@@ -415,3 +419,47 @@ def smir_generator_hybrid(
             "h_early": h_early, "tail": tail, "n_mix": n_mix, "T60": T60,
             "mix_time": n_mix / procFs}
     return h, beta_hat
+
+
+def smir_generator_hybrid_batch(varying, n_workers=None, return_beta=False,
+                                base_seed=0, **common):
+    """Parallel CPU batch of :func:`smir_generator_hybrid` for dataset building.
+
+    The hybrid analogue of :func:`smir_generator_batch`: each item runs an
+    independent :func:`smir_generator_hybrid` call. The exact early part's native
+    image loop releases the GIL, so a thread pool scales with cores; the diffuse
+    tail is NumPy. Use this on a CPU host; on a GPU server use
+    ``SmirArray(..., tail="diffuse")`` instead (one precompute, batched on the
+    device).
+
+    Parameters
+    ----------
+    varying : sequence of dict
+        Per-RIR keyword overrides (e.g. ``s``, ``sphLocation``), merged onto
+        ``common``. A per-item ``seed`` is honoured if present; otherwise each
+        item gets ``base_seed + index`` so tails are reproducible and distinct.
+    n_workers : int, optional
+        Thread-pool size (default ``os.cpu_count()``).
+    return_beta : bool, optional
+        If True return ``(h, beta_hat)`` per item; otherwise just ``h``.
+    base_seed : int, optional
+        Base for per-item tail seeds (see ``varying``).
+    **common
+        Keyword arguments shared by every call.
+    """
+    items = list(varying)
+    if not items:
+        return []
+
+    def _run(arg):
+        i, params = arg
+        kw = {**common, **params}
+        kw.setdefault("seed", base_seed + i)
+        h, beta_hat = smir_generator_hybrid(**kw)
+        return (h, beta_hat) if return_beta else h
+
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
+    n_workers = max(1, min(n_workers, len(items)))
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+        return list(ex.map(_run, enumerate(items)))

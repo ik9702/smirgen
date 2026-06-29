@@ -16,14 +16,16 @@ Example
 """
 
 from .generator import smir_generator, smir_generator_batch, order_per_freq
-from .hybrid import smir_generator_hybrid, hybrid_params
+from .hybrid import (smir_generator_hybrid, smir_generator_hybrid_batch,
+                     hybrid_params)
 from .coords import sph2cart, cart2sph
 from .plotting import plot_geometry
 from .analysis import relative_db, direct_reference
 from .torch_gen import SmirArray            # GPU backend (torch imported lazily)
 
 __all__ = ["smir_generator", "smir_generator_batch", "order_per_freq",
-           "smir_generator_hybrid", "hybrid_params",
+           "smir_generator_hybrid", "smir_generator_hybrid_batch",
+           "hybrid_params",
            "sph2cart", "cart2sph", "plot_geometry", "relative_db",
            "direct_reference", "SmirArray"]
-__version__ = "2.9.0"
+__version__ = "2.10.0"

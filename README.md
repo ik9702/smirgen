@@ -192,6 +192,32 @@ h = arr.generate(source_positions,     # (N, 3) array of source positions
 - For multiple GPUs, build one `SmirArray` per `device="cuda:i"` and split the
   sources across them.
 
+#### GPU-batch hybrid (long, reverberant RIRs)
+
+For long T60 the full image method is prohibitively expensive (image count ∝
+`order³`). Pass `tail="diffuse"` to compute only the bounded-`early_order` image
+part on the GPU and fill the late tail with the diffuse-field statistical model
+(see [Long RIRs](#long-rirs--hybrid-generation)) — the GPU-batched analogue of
+`smir_generator_hybrid`. The diffuse coherence is source-independent and
+precomputed once; only the per-source noise and seam level vary.
+
+```python
+arr = SmirArray(
+    c=343, procFs=16000, sphLocation=center, L=room, beta=0.7,   # beta = T60 (s)
+    sphType="rigid", sphRadius=0.1, mic=mic, N_harm=N_harm,
+    nsample=11200, K=1, HP=0, fmin=10,
+    tail="diffuse",                 # early ISM + diffuse statistical tail
+    device="cuda", dtype="complex64")
+# optional: early_order=..., mix_time=..., tail_gain=..., xfade_ms=...
+h = arr.generate(source_positions, source_batch=64, seed=0)   # reproducible tails
+```
+
+`early_order` and `mix_time` auto-derive from the room (as in `hybrid_params`)
+when omitted. `seed` makes the tails reproducible (the exact noise also depends
+on `source_batch`; the T60/coherence statistics do not). `return_H` is not
+supported with the tail. On a CPU host use
+`smir_generator_hybrid_batch(varying, base_seed=0, **common)` instead.
+
 ### Precision: `complex64` vs `complex128`
 
 `SmirArray` matches `smir_generator` to **~1e-7** in `complex128` and **~1.5e-5**
